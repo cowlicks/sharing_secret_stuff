@@ -6,14 +6,16 @@
 //! threshold number of shares (we call this number `k`) you can reconstruct the secret.
 //!
 //! ```
-//! //use crate::split_secret;
+//! use share_secret_stuff::{split_secret, reconstruct_secret};
 //!
-//! //let s = b"Q"; // our favorite byte
-//! //let n_shares = 12;
-//! //let k_threshold = 7;
+//! let secret = b"Hello, world!"; // My favorite secret
+//! let n_shares: u8 = 12;         // Max shares is 255
+//! let k_threshold: u8 = 7;       // Threshold must be less than number of shares
 //!
-//! //// we have `n_shares` shares, each share has a polynomial for each byte of the secret.
-//! //let shares = split_secret(s, n_shares, k_threshold);
+//! // we have `n_shares` shares, each share has a polynomial for each byte of the secret.
+//! let shares = split_secret(secret, k_threshold, n_shares).unwrap();
+//! let result = reconstruct_secret(&shares[..(k_threshold as usize)]).unwrap();
+//! assert_eq!(result, secret);
 //! ```
 
 use core::{
@@ -107,25 +109,58 @@ impl Div for GF28Element {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {}
-// TODO Should we have a `Share` or `Poly` type? or others?
-//pub struct Share(Vec<GF28Element>);
+// NB: we choose to use the same `x` value for every polynomial of our share
+pub struct Share {
+    x: GF28Element,
+    ys: Vec<GF28Element>,
+}
 
-fn split_secret(
-    secret: &[u8],
-    k: u8,
-    n: u8,
-) -> Result<Vec<Vec<(GF28Element, GF28Element)>>, Error> {
-    let mut shares_vec = vec![vec![]; n as usize];
+impl Share {
+    fn get_coord(&self, i: usize) -> Option<(GF28Element, GF28Element)> {
+        self.ys.get(i).map(|y| (self.x, *y))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("Zero shares provided")]
+    ZeroShares,
+    #[error("Shares provided don't have matching number of coordinates")]
+    MismatchedCoordinatesInShares,
+    #[error("Threshold [{0}] is greater than the number of shares [{1}]")]
+    ThresholdTooHigh(u8, u8),
+    #[error("Threshold [{0}] is too small")]
+    ThresholdTooSmall(u8),
+}
+
+// While using this I've accidentally swapped k & n. This will error but maybe these should be
+// newtyped to prevent this.
+/// Split provided `secret` into `n` shares so that it requires a threshold of `k` number of shares
+/// to reconstruct the secret.
+pub fn split_secret(secret: &[u8], k: u8, n: u8) -> Result<Vec<Share>, Error> {
+    if k > n {
+        return Err(Error::ThresholdTooHigh(k, n));
+    }
+
+    if k <= 1 {
+        return Err(Error::ThresholdTooSmall(k));
+    }
+
+    let polynomial_degree = k as usize - 1;
+    // NB: start at x = 1 because f(x = 0) is the secret value
+    let mut shares_vec: Vec<Share> = (1..=n)
+        .map(|i| Share {
+            x: GF28Element(i),
+            ys: Vec::with_capacity(secret.len()),
+        })
+        .collect();
     // create a random polynomial for each byte
     for sbyte in secret {
-        let poly = create_polynomial((*sbyte).into(), (k - 1) as usize);
+        let poly = create_polynomial((*sbyte).into(), polynomial_degree);
         // evaluate the polynomial at `n` random points for each share
-        for share in &mut shares_vec {
-            let x = GF28Element::random();
-            let y = evaluate_polynomial(x, &poly);
-            share.push((x, y));
+        for share in shares_vec.iter_mut() {
+            let y = evaluate_polynomial(share.x, &poly);
+            share.ys.push(y);
         }
     }
 
@@ -164,19 +199,20 @@ pub fn poly_pow(a: GF28Element, pow: usize) -> GF28Element {
     acc
 }
 
-pub fn poly_div(numerator: GF28Element, denomenator: GF28Element) -> GF28Element {
-    poly_mul(numerator, poly_inv(denomenator))
-}
-
 /// Build a random polynomial of the given `degree` whose constant term is `secret`.
 ///
 /// Coefficients are constant-first: `out[0]` is the secret, `out[degree]` is the
 /// leading coefficient. A degree `d` polynomial has `d + 1` coefficients.
 pub fn create_polynomial(secret: GF28Element, degree: usize) -> Vec<GF28Element> {
-    let mut out = vec![8u8; degree + 1];
-    out[0] = secret.into();
-    rand::fill(&mut out[1..]);
-    out.into_iter().map(GF28Element::from).collect()
+    (0..degree + 1)
+        .map(|i| {
+            if i == 0 {
+                secret
+            } else {
+                GF28Element::random()
+            }
+        })
+        .collect()
 }
 
 /// Use [Horner's rule](https://en.wikipedia.org/wiki/Horner%27s_method) to evaluate the polynomial.
@@ -186,6 +222,7 @@ pub fn evaluate_polynomial(x: GF28Element, poly: &[GF28Element]) -> GF28Element 
         .fold(GF28Element(0), |acc, &a| acc * x + a)
 }
 
+/// Interpolate a polynomial over the given points, returning the y value at x = 0.
 pub fn lagrange_interpolation(coords: &[(GF28Element, GF28Element)]) -> GF28Element {
     let mut sum = GF28Element(0);
     for (i, (x_i, y_i)) in coords.iter().copied().enumerate() {
@@ -201,9 +238,36 @@ pub fn lagrange_interpolation(coords: &[(GF28Element, GF28Element)]) -> GF28Elem
     sum
 }
 
+pub fn reconstruct_secret(shares: &[Share]) -> Result<Vec<u8>, Error> {
+    let Some(s) = shares.first() else {
+        return Err(Error::ZeroShares);
+    };
+    let n_ys = s.ys.len();
+    for s in shares {
+        if n_ys != s.ys.len() {
+            return Err(Error::MismatchedCoordinatesInShares);
+        }
+    }
+
+    let mut out = vec![];
+
+    for i in 0..n_ys {
+        let mut coords = vec![];
+        for s in shares {
+            coords.push(s.get_coord(i).expect("length checked above"));
+        }
+        let res = lagrange_interpolation(&coords);
+        out.push(res.0);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 pub mod test {
-    use crate::evaluate_polynomial;
+    use crate::{
+        create_polynomial, evaluate_polynomial, lagrange_interpolation, reconstruct_secret,
+        split_secret,
+    };
 
     use super::{GF28Element, poly_mul, poly_pow, u8_repr};
     macro_rules! chk_poly {
@@ -244,6 +308,122 @@ pub mod test {
             // frobenius
             assert_eq!((a + b) * (a + b), (a * a + b * b));
         };
+    }
+
+    macro_rules! chk_eval {
+        ($poly:expr, $x:expr => $expected:expr) => {
+            assert_eq!(
+                evaluate_polynomial(GF28Element($x), &$poly),
+                GF28Element($expected)
+            );
+        };
+    }
+
+    /// Deliberately naive evaluator: the literal sum of `a_i * x^i`.
+    ///
+    /// Exists only to cross-check [`evaluate_polynomial`], which uses Horner's
+    /// rule. Two independent implementations agreeing is a stronger check than
+    /// any hand-computed vector.
+    fn naive_evaluate(x: GF28Element, poly: &[GF28Element]) -> GF28Element {
+        poly.iter()
+            .enumerate()
+            .fold(GF28Element(0), |acc, (i, &a)| acc + a * poly_pow(x, i))
+    }
+
+    #[test]
+    fn share_one_byte() {
+        let secret = GF28Element(42);
+        let threshold = 4;
+        let poly_degree = threshold - 1;
+        let polynomial = create_polynomial(secret, poly_degree);
+        let mut shares = vec![];
+        for x_i in 1..=(threshold + 1) {
+            let x = GF28Element(x_i as u8);
+            let y = evaluate_polynomial(x, &polynomial);
+            shares.push((x, y));
+        }
+        let res = lagrange_interpolation(&shares[..threshold]);
+        assert_eq!(res, secret);
+    }
+
+    #[test]
+    fn split_and_reconstruct() {
+        let secret = b"Hello, world!";
+        let n = 20;
+        let k = 10;
+        let shares = split_secret(secret, k, n).unwrap();
+        let result = reconstruct_secret(&shares[0..(k as usize)]).unwrap();
+        assert_eq!(result, secret);
+
+        // too few shares produces wrong result
+        let wrong_result = reconstruct_secret(&shares[0..((k as usize) - 1)]).unwrap();
+        assert_ne!(wrong_result, secret);
+    }
+
+    /// Vectors chosen so integer arithmetic on `u8` gives a *different* answer
+    /// than GF(2^8) does. Without that property a test still passes when `+` is
+    /// an integer add and `*` an integer multiply.
+    #[test]
+    fn poly_eval_field_vectors() {
+        // f(x) = 0x05*x + 0x09
+        let deg1 = [0x09, 0x05].map(GF28Element);
+        chk_eval!(deg1, 0x01 => 0x0C); // over the integers: 0x0E
+        chk_eval!(deg1, 0x07 => 0x12); // over the integers: 0x2C
+        // NB: 0x04 agrees with integer arithmetic -- 5*4 produces no carries --
+        // so it discriminates nothing. Kept as an illustration.
+        chk_eval!(deg1, 0x04 => 0x1D);
+
+        // f(x) = 0x03*x^2 + 0x05*x + 0x09. Degree 2 exercises a second Horner
+        // step, and x = 0x80 pushes intermediates past degree 7 so that the
+        // reduction in poly_modulus actually runs.
+        let deg2 = [0x09, 0x05, 0x03].map(GF28Element);
+        chk_eval!(deg2, 0x02 => 0x0F);
+        chk_eval!(deg2, 0x80 => 0x0A);
+    }
+
+    /// Horner must agree with the naive evaluator on every point of the field.
+    #[test]
+    fn horner_matches_naive() {
+        for degree in 0..8 {
+            let mut coeffs = vec![0u8; degree + 1];
+            rand::fill(&mut coeffs[..]);
+            let poly: Vec<GF28Element> = coeffs.into_iter().map(GF28Element).collect();
+
+            for x in 0..=u8::MAX {
+                let x = GF28Element(x);
+                assert_eq!(
+                    evaluate_polynomial(x, &poly),
+                    naive_evaluate(x, &poly),
+                    "degree {degree}, x = {x:?}, poly = {poly:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn poly_eval_test() {
+        assert_eq!(evaluate_polynomial(0.into(), &[0.into()]), GF28Element(0));
+        assert_eq!(evaluate_polynomial(0.into(), &[4.into()]), GF28Element(4));
+        assert_eq!(evaluate_polynomial(6.into(), &[4.into()]), GF28Element(4));
+        assert_eq!(
+            evaluate_polynomial(0.into(), &[0.into(), 1.into()]),
+            GF28Element(0)
+        );
+        assert_eq!(
+            evaluate_polynomial(1.into(), &[0.into(), 1.into()]),
+            GF28Element(1)
+        );
+    }
+
+    #[test]
+    fn inv_test() {
+        for i in 1..256 {
+            println!("i = {i}");
+            let a = GF28Element::from(u8::try_from(i).unwrap());
+            let a_inv = a.inv();
+            dbg!(&a_inv);
+            assert_eq!(a * a.inv(), GF28Element::from(1));
+        }
     }
     #[test]
     fn foo() {
