@@ -1,18 +1,20 @@
 #![expect(clippy::suspicious_arithmetic_impl)]
 //! # ⚠️ WARNING ⚠️
-//! Do not use this code for anythig real! This crate is for educational purposes only.
+//! Do not use this code for anything real! This crate is for educational purposes only.
 //!
-//! ## Shamire Secret Sharing over GF(2⁸)
-//! It allows you to split a secret into a given number of shares (we call this number `n`), so that by collecting some threshold number of shares (we call this number `k`) you can reconstruct the secret.
+//! ## Shamir's Secret Sharing over GF(2⁸)
+//! Split a secret into some number of shares (we call this number `n`). Collecting a threshold
+//! number of those shares (we call this number `k`) reconstructs the secret. Collecting fewer than
+//! `k` reveals nothing at all.
 //!
 //! ```
 //! use share_secret_stuff::{split_secret, reconstruct_secret};
 //!
 //! let secret = b"Hello, world!"; // My favorite secret
 //! let n_shares: u8 = 12;         // Max shares is 255
-//! let k_threshold: u8 = 7;       // Threshold must be less than number of shares
+//! let k_threshold: u8 = 7;       // Threshold must not exceed the number of shares
 //!
-//! // we have `n_shares` shares, each share has a polynomial for each byte of the secret.
+//! // We get `n_shares` shares. Each one holds a single point from each byte's polynomial.
 //! let shares = split_secret(secret, k_threshold, n_shares).unwrap();
 //! let result = reconstruct_secret(&shares[..(k_threshold as usize)]).unwrap();
 //! assert_eq!(result, secret);
@@ -23,21 +25,23 @@ use core::{
     ops::{Add, Div, Mul, Sub},
 };
 
-/// Implmentation of polynomial multiplication over GF(2⁸). We keep all the code using the [`u8`]
-/// representation of the field contained in this module to avoid accidentally using the regular `u8`
-/// arithmetic.
+/// Implementation of polynomial multiplication over GF(2⁸). All code using the [`u8`]
+/// representation of the field is kept inside this module, so that ordinary `u8` arithmetic can't
+/// be used by accident.
 ///
-/// DANGER: This implementation branches on data, so it could be used in a side-channel attack to retreive information about the secret.
+/// DANGER: This implementation branches on data, so it could be used in a side-channel attack to
+/// retrieve information about the secret.
 ///
-/// The implementation is naive. It's done in two steps. First, do regular multiplication (without a
-/// modulus) which gives a result with a degree possibly up to 14, so we use a `u16`. Then we reduce
-/// the polynomial by our modulus by repeadetly dividing it by the irreducible polynomial.
+/// The implementation is naive, and done in two steps. First, multiply the two polynomials out
+/// without any modulus, which gives a result of degree up to 14 -- hence the `u16`. Then reduce
+/// that back below degree 8 by repeatedly subtracting shifted copies of the irreducible
+/// polynomial.
 mod u8_repr {
     /// MODULUS used to reduce polynomial to degree 8: m(x) = x^8 + x^4 + x^3 + x + 1
     const MODULUS: u16 = 0b100011011;
 
     const DEGREE: usize = 8;
-    /// Multiply out two <= degree 7 polynomials into a <= degree 14 polynomial
+    /// Multiply two polynomials of degree <= 7 into a single polynomial of degree <= 14.
     fn mul_expanded(a: u8, b: u8) -> u16 {
         let mut product: u16 = 0;
         for i in 0..DEGREE {
@@ -48,8 +52,9 @@ mod u8_repr {
         product
     }
 
-    // NB: this brances on data should be constant time in a real-world implementation
-    /// Reduce a degree 14 polynomial to degree 7. Used for polynomial multiplication.
+    // NB: this branches on data. A real-world implementation would be constant time.
+    /// Reduce a polynomial of degree <= 14 down to degree <= 7. Used for polynomial
+    /// multiplication.
     fn poly_modulus(poly: u16) -> u8 {
         let mut out = poly;
         for i in (8..15).rev() {
@@ -91,15 +96,68 @@ mod u8_repr {
     }
 }
 
-/// Element of Galois Field 256
+/// An element of the Galois field GF(2⁸).
+///
+/// The byte holds the coefficients of a polynomial of degree 7 or less over GF(2), where bit `i`
+/// is the coefficient of `x^i`. So `0b0000_0011` is the polynomial `x + 1`.
+///
+/// This is **not** arithmetic modulo 256. ℤ/256 is not a field: `2 * 128 == 0` there, so it has
+/// zero divisors and most of its elements have no inverse. Here every element except `0` is
+/// invertible, which is exactly what Lagrange interpolation needs.
+///
+/// # Arithmetic
+///
+/// We define our field the same way as the [Advanced Encryption Standard (AES)](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.197-upd1.pdf). See the linked document for a full explanation.
+///
+/// Addition are the same and they're both XOR.
+///
+/// Multiplication multiplies the two polynomials out, then takes the remainder modulo the
+/// irreducible polynomial `x⁸ + x⁴ + x³ + x + 1` -- the same as AES. The following example is taken from [FIPS-197
+/// (AES)](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.197-upd1.pdf).
+///
+/// Division is just is defined using multiplicative inverses so: `a / b == a * b.inv()`. Note that
+/// division by zero returns zero but should be considered undefined behavior.
+///
+/// ```
+/// use share_secret_stuff::GF28Element;
+///
+/// let a = GF28Element::from(42);
+/// let b = GF28Element::from(11);
+/// let additive_identity = GF28Element::from(0);
+/// let mul_identity = GF28Element::from(1);
+/// let expected = GF28Element::from(11 ^ 42);
+///
+/// assert_eq!(a + a, additive_identity);
+/// assert_eq!(b + additive_identity, b);
+/// assert_eq!(a + b, expected);
+/// assert_eq!(a - b, expected);
+/// assert_eq!(b - a, expected);
+///
+///
+/// // Taken from FIPS-197
+/// assert_eq!(
+///     GF28Element::from(0x57) * GF28Element::from(0x83),
+///     GF28Element::from(0xc1),
+/// );
+/// assert_eq!(a * mul_identity, a);
+///
+///
+/// assert_eq!(a.inv(), GF28Element::from(152));
+/// assert_eq!(a * a.inv(), GF28Element::from(1));
+/// assert_eq!(a / a, GF28Element::from(1));
+/// assert_eq!(a / mul_identity, a);
+/// ```
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct GF28Element(pub(crate) u8);
 
 impl GF28Element {
+    /// The multiplicative inverse, computed as `self²⁵⁴` via Fermat's little theorem.
+    ///
+    /// Returns `0` for an input of `0`, which is undefined. See the type's documentation.
     pub fn inv(self) -> Self {
         poly_inv(self)
     }
-    /// cryptographically secure random value
+    /// A uniformly random element, drawn from a cryptographically secure source.
     fn random() -> Self {
         Self(rand::random::<u8>())
     }
@@ -219,9 +277,9 @@ fn poly_pow(a: GF28Element, pow: usize) -> GF28Element {
     acc
 }
 
-/// Recall that in a group of size N (here 255) multiplying an element by itself 255 times gives
-/// the identity (1). So it stands that if : a**255 = 1 then a**254 = a**-1.
-/// This is known as fermat's little theorem. We use it to calculate the inverse of elements.
+/// Recall that in a group of size N (here 255), raising any element to the power N gives the
+/// identity (1). So if `a**255 == 1`, then `a**254 == a**-1`. This is Fermat's little theorem, and
+/// we use it to calculate the inverse of an element.
 fn poly_inv(a: GF28Element) -> GF28Element {
     let a2 = poly_pow(a, 2);
     let a3 = a2 * a;
