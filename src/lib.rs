@@ -1,9 +1,9 @@
 #![expect(clippy::suspicious_arithmetic_impl)]
-//! Implementation of GF(2^8)
-//! We need a new polynomial for every byte
+//! # ⚠️ WARNING ⚠️
+//! Do not use this code for anythig real! This crate is for educational purposes only.
 //!
-//! Split a secret into a given number of shares (we call this number `n`), so that by collecting some
-//! threshold number of shares (we call this number `k`) you can reconstruct the secret.
+//! ## Shamire Secret Sharing over GF(2⁸)
+//! It allows you to split a secret into a given number of shares (we call this number `n`), so that by collecting some threshold number of shares (we call this number `k`) you can reconstruct the secret.
 //!
 //! ```
 //! use share_secret_stuff::{split_secret, reconstruct_secret};
@@ -23,15 +23,22 @@ use core::{
     ops::{Add, Div, Mul, Sub},
 };
 
-/// Math with our polynomials in their [`u8`] representation. We hide it in a module so we don't use
-/// them accidentally. All [`u8`] code lives here, no [`u8`] lives outside here.
+/// Implmentation of polynomial multiplication over GF(2⁸). We keep all the code using the [`u8`]
+/// representation of the field contained in this module to avoid accidentally using the regular `u8`
+/// arithmetic.
+///
+/// DANGER: This implementation branches on data, so it could be used in a side-channel attack to retreive information about the secret.
+///
+/// The implementation is naive. It's done in two steps. First, do regular multiplication (without a
+/// modulus) which gives a result with a degree possibly up to 14, so we use a `u16`. Then we reduce
+/// the polynomial by our modulus by repeadetly dividing it by the irreducible polynomial.
 mod u8_repr {
     /// MODULUS used to reduce polynomial to degree 8: m(x) = x^8 + x^4 + x^3 + x + 1
     const MODULUS: u16 = 0b100011011;
 
     const DEGREE: usize = 8;
     /// Multiply out two <= degree 7 polynomials into a <= degree 14 polynomial
-    pub fn mul_expanded(a: u8, b: u8) -> u16 {
+    fn mul_expanded(a: u8, b: u8) -> u16 {
         let mut product: u16 = 0;
         for i in 0..DEGREE {
             if (b >> i) & 1 != 0 {
@@ -41,8 +48,9 @@ mod u8_repr {
         product
     }
 
-    /// Reduce a degree 14 polynomial to degree 7
-    pub fn poly_modulus(poly: u16) -> u8 {
+    // NB: this brances on data should be constant time in a real-world implementation
+    /// Reduce a degree 14 polynomial to degree 7. Used for polynomial multiplication.
+    fn poly_modulus(poly: u16) -> u8 {
         let mut out = poly;
         for i in (8..15).rev() {
             // If bit i is set, the current value has an x^i term to cancel.
@@ -56,13 +64,39 @@ mod u8_repr {
 
         out as u8
     }
+
+    pub fn poly_mul(a: u8, b: u8) -> u8 {
+        let mid = mul_expanded(a, b);
+        poly_modulus(mid)
+    }
+
+    #[cfg(test)]
+    mod test {
+        use super::mul_expanded;
+
+        macro_rules! chk_poly {
+            ($a:expr, $b:expr, $expected:expr) => {
+                let res1 = mul_expanded($a, $b);
+                assert_eq!(res1, $expected);
+                let res2 = mul_expanded($b, $a);
+                assert_eq!(res2, $expected);
+            };
+        }
+        #[test]
+        fn foo() {
+            chk_poly!(128, 128, 1 << (7 + 7));
+            chk_poly!(128, 1, 128);
+            chk_poly!(128, 0, 0);
+        }
+    }
 }
 
+/// Element of Galois Field 256
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct GF28Element(pub(crate) u8);
 
 impl GF28Element {
-    fn inv(self) -> Self {
+    pub fn inv(self) -> Self {
         poly_inv(self)
     }
     /// cryptographically secure random value
@@ -109,7 +143,9 @@ impl Div for GF28Element {
     }
 }
 
-// NB: we choose to use the same `x` value for every polynomial of our share
+// NB: we choose to use the same `x` value for every polynomial of our share. They could be
+// different in theory, we just do this for conveinience.
+/// A "share" is used to reconstruct a secret when combined with other shares.
 pub struct Share {
     x: GF28Element,
     ys: Vec<GF28Element>,
@@ -122,6 +158,7 @@ impl Share {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Error type for secret sharing
 pub enum Error {
     #[error("Zero shares provided")]
     ZeroShares,
@@ -167,28 +204,11 @@ pub fn split_secret(secret: &[u8], k: u8, n: u8) -> Result<Vec<Share>, Error> {
     Ok(shares_vec)
 }
 
-pub fn poly_mul(a: GF28Element, b: GF28Element) -> GF28Element {
-    let mid = u8_repr::mul_expanded(a.into(), b.into());
-    u8_repr::poly_modulus(mid).into()
+fn poly_mul(a: GF28Element, b: GF28Element) -> GF28Element {
+    u8_repr::poly_mul(a.into(), b.into()).into()
 }
 
-/// Recall that in a group of size N (here 255) multiplying an element by itself 255 times gives
-/// the identity (1). So it stands that if : a**255 = 1 then a**254 = a**-1.
-/// This is known as fermat's little theorem. We use it to calculate the inverse of elements.
-pub fn poly_inv(a: GF28Element) -> GF28Element {
-    //let a2: u8 = a.pow(2);
-    let a2 = poly_pow(a, 2);
-    let a3 = a2 * a;
-    //let a12 = a3.pow(4);
-    let a12 = poly_pow(a3, 4);
-    let a14 = a12 * a2;
-    let a15 = a12 * a3;
-    //let a240 = a15.pow(16);
-    let a240 = poly_pow(a15, 16);
-    a240 * a14
-}
-
-pub fn poly_pow(a: GF28Element, pow: usize) -> GF28Element {
+fn poly_pow(a: GF28Element, pow: usize) -> GF28Element {
     if pow == 0 {
         return 1.into();
     }
@@ -197,6 +217,19 @@ pub fn poly_pow(a: GF28Element, pow: usize) -> GF28Element {
         acc = poly_mul(acc, a);
     }
     acc
+}
+
+/// Recall that in a group of size N (here 255) multiplying an element by itself 255 times gives
+/// the identity (1). So it stands that if : a**255 = 1 then a**254 = a**-1.
+/// This is known as fermat's little theorem. We use it to calculate the inverse of elements.
+fn poly_inv(a: GF28Element) -> GF28Element {
+    let a2 = poly_pow(a, 2);
+    let a3 = a2 * a;
+    let a12 = poly_pow(a3, 4);
+    let a14 = a12 * a2;
+    let a15 = a12 * a3;
+    let a240 = poly_pow(a15, 16);
+    a240 * a14
 }
 
 /// Build a random polynomial of the given `degree` whose constant term is `secret`.
@@ -222,7 +255,7 @@ pub fn evaluate_polynomial(x: GF28Element, poly: &[GF28Element]) -> GF28Element 
         .fold(GF28Element(0), |acc, &a| acc * x + a)
 }
 
-/// Interpolate a polynomial over the given points, returning the y value at x = 0.
+/// Interpolate a polynomial over the given points, returning the `y` value at `x = 0`.
 pub fn lagrange_interpolation(coords: &[(GF28Element, GF28Element)]) -> GF28Element {
     let mut sum = GF28Element(0);
     for (i, (x_i, y_i)) in coords.iter().copied().enumerate() {
@@ -238,10 +271,15 @@ pub fn lagrange_interpolation(coords: &[(GF28Element, GF28Element)]) -> GF28Elem
     sum
 }
 
+/// Combine the given shares to recreate the secret.
+///
+/// The number of shares must be greater than or equal to the `k` threshold value. If not, the
+/// function will still return `Ok`, but with an incorrect value.
 pub fn reconstruct_secret(shares: &[Share]) -> Result<Vec<u8>, Error> {
     let Some(s) = shares.first() else {
         return Err(Error::ZeroShares);
     };
+
     let n_ys = s.ys.len();
     for s in shares {
         if n_ys != s.ys.len() {
@@ -254,10 +292,13 @@ pub fn reconstruct_secret(shares: &[Share]) -> Result<Vec<u8>, Error> {
     for i in 0..n_ys {
         let mut coords = vec![];
         for s in shares {
-            coords.push(s.get_coord(i).expect("length checked above"));
+            coords.push(
+                s.get_coord(i)
+                    .expect("length checked above where assert all ys are the same length"),
+            );
         }
         let res = lagrange_interpolation(&coords);
-        out.push(res.0);
+        out.push(res.into());
     }
     Ok(out)
 }
@@ -269,15 +310,7 @@ pub mod test {
         split_secret,
     };
 
-    use super::{GF28Element, poly_mul, poly_pow, u8_repr};
-    macro_rules! chk_poly {
-        ($a:expr, $b:expr, $expected:expr) => {
-            let res1 = u8_repr::mul_expanded($a, $b);
-            assert_eq!(res1, $expected);
-            let res2 = u8_repr::mul_expanded($b, $a);
-            assert_eq!(res2, $expected);
-        };
-    }
+    use super::{GF28Element, poly_mul, poly_pow};
 
     macro_rules! chk_mul {
         ($a:expr, $b:expr, $expected:expr) => {
@@ -361,7 +394,7 @@ pub mod test {
     }
 
     /// Vectors chosen so integer arithmetic on `u8` gives a *different* answer
-    /// than GF(2^8) does. Without that property a test still passes when `+` is
+    /// than GF(2⁸) does. Without that property a test still passes when `+` is
     /// an integer add and `*` an integer multiply.
     #[test]
     fn poly_eval_field_vectors() {
@@ -418,18 +451,9 @@ pub mod test {
     #[test]
     fn inv_test() {
         for i in 1..256 {
-            println!("i = {i}");
             let a = GF28Element::from(u8::try_from(i).unwrap());
-            let a_inv = a.inv();
-            dbg!(&a_inv);
             assert_eq!(a * a.inv(), GF28Element::from(1));
         }
-    }
-    #[test]
-    fn foo() {
-        chk_poly!(128, 128, 1 << (7 + 7));
-        chk_poly!(128, 1, 128);
-        chk_poly!(128, 0, 0);
     }
 
     #[test]
