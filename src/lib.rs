@@ -8,7 +8,7 @@
 //! `k` reveals nothing at all.
 //!
 //! ```
-//! use share_secret_stuff::{split_secret, reconstruct_secret};
+//! use how_to_share_a_secret::{split_secret, reconstruct_secret};
 //!
 //! let secret = b"Hello, world!"; // My favorite secret
 //! let n_shares: u8 = 12;         // Max shares is 255
@@ -119,7 +119,7 @@ mod u8_repr {
 /// division by zero returns zero but should be considered undefined behavior.
 ///
 /// ```
-/// use share_secret_stuff::GF28Element;
+/// use how_to_share_a_secret::GF28Element;
 ///
 /// let a = GF28Element::from(42);
 /// let b = GF28Element::from(11);
